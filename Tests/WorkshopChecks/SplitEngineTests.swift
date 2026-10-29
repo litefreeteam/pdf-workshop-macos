@@ -107,6 +107,100 @@ final class SplitEngineTests {
         XCTAssertEqual(output.pageCount, 2)
     }
 
+    func testPageRangeInputAndFileOrder() throws {
+        XCTAssertEqual(try PageRanges.parse("1-3, 5, 8-10", pageCount: 10), [1...3, 5...5, 8...10])
+        XCTAssertEqual(try PageRanges.parse(" 1 – 2，4；6\n8-10 ", pageCount: 10), [1...2, 4...4, 6...6, 8...10])
+        XCTAssertEqual(try PageRanges.parse("4-5;1-2", pageCount: 5), [4...5, 1...2])
+        XCTAssertEqual(try PageRanges.parse("1", pageCount: 1), [1...1])
+        for input in ["", " ", "0", "-1", "4-2", "1-11", "1-3,3-4", "1,1", "1,,2", "1,", "1-2-3", "abc", "1.5", "1 2", "999999999999999999999999"] {
+            XCTAssertThrowsError(try PageRanges.parse(input, pageCount: 10))
+        }
+    }
+
+    func testPageRangesPreserveEditedPagesAndSelectedFileOrder() throws {
+        let source = try fixture(pages: 7)
+        let before = try Data(contentsOf: source)
+        let edited = try XCTUnwrap(PDFDocument(url: source))
+        let changed = try XCTUnwrap(edited.page(at: 4))
+        changed.rotation = 90
+        changed.setBounds(CGRect(x: 10, y: 20, width: 320, height: 430), for: .cropBox)
+        let snapshot = folder.appendingPathComponent("edited.pdf")
+        try PDFEngine.snapshot(edited).write(to: snapshot)
+        let expected = try XCTUnwrap(PDFDocument(url: snapshot))
+        let ranges = try PageRanges.parse("5-6, 1-2, 7", pageCount: 7)
+        let request = SplitRequest(source: snapshot, destination: folder, selection: .pageRanges(ranges))
+        let result = try SplitEngine.run(request) { progress in
+            XCTAssertEqual(progress.totalPages, 5)
+            XCTAssertLessThanOrEqual(progress.completedPages, 5)
+        }
+        XCTAssertEqual(result.parts.count, 3)
+        XCTAssertEqual(result.exportedPageCount, 5)
+        XCTAssertEqual(result.sourcePageCount, 7)
+        for (range, part) in zip(ranges, result.parts) {
+            XCTAssertEqual(part.firstPage, range.lowerBound)
+            XCTAssertEqual(part.lastPage, range.upperBound)
+            let output = try XCTUnwrap(PDFDocument(url: part.url))
+            XCTAssertEqual(output.pageCount, range.count)
+            for (offset, pageNumber) in range.enumerated() {
+                let actual = try XCTUnwrap(output.page(at: offset))
+                let wanted = try XCTUnwrap(expected.page(at: pageNumber - 1))
+                XCTAssertEqual(actual.string, wanted.string, "Range pages and file order must match the input")
+                XCTAssertEqual(actual.rotation, wanted.rotation)
+                XCTAssertEqual(actual.bounds(for: .cropBox), wanted.bounds(for: .cropBox))
+                XCTAssertEqual(render(actual), render(wanted), "Edited pages must render unchanged")
+            }
+            XCTAssertEqual(part.byteCount, try Data(contentsOf: part.url).count)
+        }
+        let repeated = try SplitEngine.run(request)
+        XCTAssertNotEqual(repeated.folder, result.folder)
+        XCTAssertEqual(try Data(contentsOf: source), before)
+        XCTAssertFalse(try children().contains { $0.hasPrefix(".pdfsplit-") })
+    }
+
+    func testEveryPageHasItsOwnPDF() throws {
+        let source = try fixture(pages: 4)
+        let ranges = (1...4).map { $0...$0 }
+        let result = try SplitEngine.run(SplitRequest(source: source, destination: folder, selection: .pageRanges(ranges)))
+        XCTAssertEqual(result.parts.count, 4)
+        XCTAssertEqual(result.exportedPageCount, 4)
+        for (index, part) in result.parts.enumerated() {
+            let document = try XCTUnwrap(PDFDocument(url: part.url))
+            XCTAssertEqual(document.pageCount, 1)
+            XCTAssertEqual(part.firstPage, index + 1)
+            XCTAssertEqual(part.lastPage, index + 1)
+            XCTAssertTrue(document.page(at: 0)?.string?.contains(String(format: "PAGE %03d", index + 1)) == true)
+        }
+    }
+
+    func testInvalidPagePlansAndCancellationLeaveNoOutput() throws {
+        let source = try fixture(pages: 4)
+        let before = Set(try children())
+        for ranges: [ClosedRange<Int>] in [[], [0...1], [1...5], [1...3, 3...4], [Int.min...Int.max]] {
+            XCTAssertThrowsError(try SplitEngine.run(SplitRequest(source: source, destination: folder, selection: .pageRanges(ranges))))
+            XCTAssertEqual(Set(try children()), before)
+        }
+        let flag = CancellationFlag()
+        XCTAssertThrowsError(try SplitEngine.run(SplitRequest(source: source, destination: folder, selection: .pageRanges([1...2, 3...4])), cancellation: flag) { progress in
+            if progress.completedPages > 0 { flag.cancel() }
+        }) { error in
+            guard case SplitError.cancelled = error else { return XCTFail("Unexpected: \(error)") }
+        }
+        XCTAssertEqual(Set(try children()), before)
+    }
+
+    func testPageRangeSplitUsesPassword() throws {
+        let source = try fixture(pages: 3)
+        let protected = folder.appendingPathComponent("protected.pdf")
+        let pdf = try XCTUnwrap(PDFDocument(url: source))
+        XCTAssertTrue(pdf.write(to: protected, withOptions: [.ownerPasswordOption: "owner", .userPasswordOption: "secret"]))
+        XCTAssertThrowsError(try SplitEngine.run(SplitRequest(source: protected, destination: folder, selection: .pageRanges([2...2]))))
+        let result = try SplitEngine.run(SplitRequest(source: protected, destination: folder, selection: .pageRanges([2...2]), password: "secret"))
+        let output = try XCTUnwrap(PDFDocument(url: result.parts[0].url))
+        XCTAssertEqual(output.pageCount, 1)
+        XCTAssertFalse(output.isLocked)
+        XCTAssertTrue(output.page(at: 0)?.string?.contains("PAGE 002") == true)
+    }
+
     private func children() throws -> [String] {
         try FileManager.default.contentsOfDirectory(atPath: folder.path)
     }

@@ -111,6 +111,8 @@ final class PageCell: NSTableCellView {
         fileMenu.addItem(withTitle: "替换页面图片…", action: #selector(replaceImages), keyEquivalent: "r")
         let splitItem = fileMenu.addItem(withTitle: "按大小拆分 PDF…", action: #selector(splitPDF), keyEquivalent: "d")
         splitItem.keyEquivalentModifierMask = [.command, .shift]
+        let pageSplitItem = fileMenu.addItem(withTitle: "按页码拆分 PDF…", action: #selector(splitPDFByPages), keyEquivalent: "d")
+        pageSplitItem.keyEquivalentModifierMask = [.command, .option]
         fileMenu.addItem(withTitle: "另存为 PDF…", action: #selector(savePDF), keyEquivalent: "s")
         let fileItem = NSMenuItem(); fileItem.submenu = fileMenu; main.addItem(fileItem)
         let editMenu = NSMenu(title: "编辑")
@@ -154,10 +156,11 @@ final class PageCell: NSTableCellView {
         let replace = button("替换图片", symbol: "arrow.triangle.2.circlepath", action: #selector(replaceImages))
         let save = button("另存 PDF", symbol: "square.and.arrow.down", action: #selector(savePDF), primary: true)
         let divide = button("按大小拆分", symbol: "scissors", action: #selector(splitPDF))
+        let dividePages = button("按页码拆分", symbol: "doc.on.doc", action: #selector(splitPDFByPages))
         let help = button("使用方法", symbol: "questionmark.circle", action: #selector(showHelp))
-        actionButtons += [export, replace, divide, save]
+        actionButtons += [export, replace, divide, dividePages, save]
         let spacer = NSView(); spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let toolbar = NSStackView(views: [open, export, replace, divide, spacer, help, save])
+        let toolbar = NSStackView(views: [open, export, replace, divide, dividePages, spacer, help, save])
         toolbar.orientation = .horizontal; toolbar.spacing = 10
         toolbar.edgeInsets = NSEdgeInsets(top: 13, left: 18, bottom: 13, right: 18)
         toolbar.translatesAutoresizingMaskIntoConstraints = false
@@ -256,13 +259,13 @@ final class PageCell: NSTableCellView {
         icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 58, weight: .light)
         let title = NSTextField(labelWithString: "PDF 的图片与大小，一站处理")
         title.font = .systemFont(ofSize: 25, weight: .semibold)
-        let subtitle = NSTextField(labelWithString: "导出图片 · 回填页面 · 按大小拆分")
+        let subtitle = NSTextField(labelWithString: "导出图片 · 回填页面 · 按大小或页码拆分")
         subtitle.font = .systemFont(ofSize: 15); subtitle.textColor = .secondaryLabelColor
         let open = button("选择 PDF 文件…", symbol: "folder", action: #selector(openPDF), primary: true)
         open.keyEquivalent = "\r"
         let drag = NSTextField(labelWithString: "也可以把 PDF 拖进窗口")
         drag.font = .systemFont(ofSize: 12); drag.textColor = .tertiaryLabelColor
-        let steps = NSTextField(wrappingLabelWithString: "① 导出高清 PNG，在外部图片工具中修改\n② 回填图片，旋转页面或调整顺序\n③ 另存 PDF，或直接按指定 MB 上限拆分")
+        let steps = NSTextField(wrappingLabelWithString: "① 导出高清 PNG，在外部图片工具中修改\n② 回填图片，旋转页面或调整顺序\n③ 另存 PDF，或直接按大小、页码范围拆分")
         steps.font = .systemFont(ofSize: 13); steps.textColor = .secondaryLabelColor
         let paragraph = NSMutableParagraphStyle(); paragraph.lineSpacing = 10
         steps.attributedStringValue = NSAttributedString(string: steps.stringValue, attributes: [.paragraphStyle: paragraph, .font: steps.font!, .foregroundColor: NSColor.secondaryLabelColor])
@@ -374,7 +377,7 @@ final class PageCell: NSTableCellView {
         document = doc; sourceURL = url; changedPages = []
         pdfView.document = doc; window.isDocumentEdited = false
         window.representedURL = url
-        status.stringValue = "已打开 \(doc.pageCount) 页 · 可导出图片、回填修改，或直接按大小拆分"
+        status.stringValue = "已打开 \(doc.pageCount) 页 · 可导出图片、回填修改，或按大小、页码拆分"
         refresh(select: 0)
     }
     func receive(_ urls: [URL]) {
@@ -416,15 +419,17 @@ final class PageCell: NSTableCellView {
         }
     }
 
-    @objc func splitPDF() {
+    @objc func splitPDF() { showSplit(mode: .size) }
+    @objc func splitPDFByPages() { showSplit(mode: .pages) }
+    func showSplit(mode: SplitMode) {
         guard !busy, let document else { return }
         if let splitSheet { splitSheet.panel.makeKeyAndOrderFront(nil); return }
         let sheet = SplitSheet(parent: window, name: sourceURL?.lastPathComponent ?? "当前文档.pdf",
-                               pages: document.pageCount, edited: window.isDocumentEdited)
+                               pages: document.pageCount, edited: window.isDocumentEdited, mode: mode)
         splitSheet = sheet
         sheet.onClose = { [weak self] in self?.splitSheet = nil }
         sheet.onCancel = { [weak self] in self?.splitCancellation?.cancel() }
-        sheet.onStart = { [weak self, weak sheet] limit, destination in
+        sheet.onStart = { [weak self, weak sheet] selection, destination in
             guard let self, let sheet else { return }
             self.setBusy(true, message: "正在准备拆分当前文档…")
             let snapshot: Data
@@ -440,7 +445,7 @@ final class PageCell: NSTableCellView {
                     try flag.check()
                     let input = temp.appendingPathComponent(filename)
                     try snapshot.write(to: input, options: .atomic)
-                    return try SplitEngine.run(SplitRequest(source: input, destination: destination, maximumBytes: limit), cancellation: flag) { value in
+                    return try SplitEngine.run(SplitRequest(source: input, destination: destination, selection: selection), cancellation: flag) { value in
                         DispatchQueue.main.async {
                             sheet.update(value)
                             self.status.stringValue = "正在拆分 \(value.completedPages) / \(value.totalPages) 页 · \(value.partCount) 份"
@@ -575,16 +580,17 @@ final class PageCell: NSTableCellView {
         let alert = NSAlert(); alert.messageText = "PDF 工坊使用方法"
         alert.informativeText = "1. 打开 PDF，选择 300 DPI，点击「导出图片」。\n2. 在系统预览、Photoshop 等工具中修改 PNG 并保存。\n3. 回到本 App，选中目标页，点击「替换图片」。\n4. 点击「另存 PDF」，生成修改后的文档。\n\n批量回填：同时选择多张图片，保留 page-0001.png 这样的文件名即可自动匹配页码。只选一张时替换当前页。\n\n原页面尺寸保持不变，图片按比例居中放置。旋转和顺序调整会体现在导出的图片和 PDF 中。\n\n所有处理在本机完成。此工具不包含 OCR 和图片绘画编辑器；扫描清晰度取决于原文件，增大 DPI 无法恢复模糊细节。"
         alert.informativeText += "\n\n按大小拆分：点击工具栏「按大小拆分」，设置 MB 上限和输出目录，再开始拆分。会使用当前窗口中的页面，包含未另存的图片替换、旋转与页序调整。若一页已超限，整次任务会取消并清理未完成结果。1 MB = 1,000,000 字节。\n\n加密文档解锁后，输出不设密码。数字签名、复杂表单与文档级书签不保证保留。"
+        alert.informativeText += "\n\n按页码拆分：输入 1-3, 4-6, 7，每组单独导出一份 PDF；也可勾选「每页单独导出一份」。未填写的页码不会导出，各组不可重复或重叠。页码指当前编辑后的页面顺序，按输入分组顺序生成文件。"
         alert.addButton(withTitle: "知道了"); alert.beginSheetModal(for: window)
     }
     @objc func about() {
         NSApp.orderFrontStandardAboutPanel(options: [
-            .applicationName: appName, .applicationVersion: "2.0.0",
-            .credits: NSAttributedString(string: "PDF 转图片 · 图片回填 · 按大小拆分\n原生 PDFKit，本地处理。MIT 开源许可。")
+            .applicationName: appName, .applicationVersion: "2.1.0",
+            .credits: NSAttributedString(string: "PDF 转图片 · 图片回填 · 按大小 / 页码拆分\n原生 PDFKit，本地处理。MIT 开源许可。")
         ])
     }
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        if [#selector(exportImages), #selector(replaceImages), #selector(savePDF), #selector(splitPDF)].contains(item.action) {
+        if [#selector(exportImages), #selector(replaceImages), #selector(savePDF), #selector(splitPDF), #selector(splitPDFByPages)].contains(item.action) {
             return document != nil && !busy && splitSheet == nil
         }
         if item.action == #selector(openPDF) { return !busy && splitSheet == nil }

@@ -1,11 +1,18 @@
 import AppKit
 import WorkshopCore
 
+enum SplitMode { case size, pages }
+
 @MainActor final class SplitSheet: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     let panel: NSPanel
     private let parent: NSWindow
+    private let mode: SplitMode
+    private let pageCount: Int
     private let limitField = NSTextField(string: "10")
     private let presets = NSSegmentedControl(labels: ["5 MB", "10 MB", "20 MB", "50 MB"], trackingMode: .selectOne, target: nil, action: nil)
+    private let rangesField = NSTextField(string: "")
+    private let eachPageButton = NSButton(checkboxWithTitle: "每页单独导出一份", target: nil, action: nil)
+    private let rangePreview = NSTextField(wrappingLabelWithString: "")
     private let folderLabel = NSTextField(labelWithString: "")
     private let chooseButton = NSButton(title: "更改…", target: nil, action: nil)
     private let message = NSTextField(wrappingLabelWithString: "")
@@ -17,19 +24,20 @@ import WorkshopCore
     private var running = false
     private var output: URL?
     var destination = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
-    var onStart: ((Int, URL) -> Void)?
+    var onStart: ((SplitSelection, URL) -> Void)?
     var onCancel: (() -> Void)?
     var onClose: (() -> Void)?
 
-    init(parent: NSWindow, name: String, pages: Int, edited: Bool) {
+    init(parent: NSWindow, name: String, pages: Int, edited: Bool, mode: SplitMode = .size) {
         self.parent = parent
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 570, height: 390),
+        self.mode = mode; self.pageCount = pages
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 570, height: mode == .pages ? 440 : 390),
                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
         super.init()
-        panel.title = "按大小拆分 PDF"
+        panel.title = mode == .pages ? "按页码拆分 PDF" : "按大小拆分 PDF"
         panel.isReleasedWhenClosed = false
         panel.delegate = self
-        let title = NSTextField(labelWithString: "让每一份，都刚刚好")
+        let title = NSTextField(labelWithString: mode == .pages ? "按页码，拆成需要的几份" : "让每一份，都刚刚好")
         title.font = .systemFont(ofSize: 22, weight: .semibold)
         let detail = NSTextField(wrappingLabelWithString: "\(name) · \(pages) 页" + (edited ? "\n将包含当前尚未另存的图片替换、旋转和页序调整。" : "\n按当前页面顺序拆分，不压缩页面画质。"))
         detail.font = .systemFont(ofSize: 12); detail.textColor = .secondaryLabelColor
@@ -43,6 +51,13 @@ import WorkshopCore
         limitRow.spacing = 10
         let units = NSTextField(labelWithString: "支持自定义 0.01–100,000 MB，1 MB = 1,000,000 字节。")
         units.font = .systemFont(ofSize: 10); units.textColor = .secondaryLabelColor
+        rangesField.stringValue = pages == 1 ? "1" : "1-\(pages)"
+        rangesField.placeholderString = "例如 1-3, 4-6, 7"
+        rangesField.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        rangesField.setAccessibilityLabel("拆分页码范围")
+        rangesField.delegate = self
+        eachPageButton.target = self; eachPageButton.action = #selector(eachPageChanged)
+        rangePreview.font = .systemFont(ofSize: 11); rangePreview.textColor = .secondaryLabelColor
         folderLabel.lineBreakMode = .byTruncatingMiddle
         folderLabel.font = .systemFont(ofSize: 11)
         folderLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -51,7 +66,9 @@ import WorkshopCore
         folderRow.spacing = 10
         chooseButton.setContentHuggingPriority(.required, for: .horizontal)
         message.font = .systemFont(ofSize: 11); message.textColor = .secondaryLabelColor
-        message.stringValue = "按完整页面拆分，每份按实际大小校验。单页超限会提示调整；原文件保持不变。加密文档解锁后，导出的副本不设密码。"
+        message.stringValue = mode == .pages
+            ? "每组单独导出一份 PDF，按输入顺序生成；未填写的页码不导出。页码按当前编辑后的顺序计算。加密文档的导出副本不设密码。"
+            : "按完整页面拆分，每份按实际大小校验。单页超限会提示调整；原文件保持不变。加密文档解锁后，导出的副本不设密码。"
         progress.style = .bar; progress.isIndeterminate = false; progress.maxValue = Double(max(1, pages)); progress.isHidden = true
         resultView.isEditable = false; resultView.isSelectable = true
         resultView.frame = NSRect(x: 0, y: 0, width: 510, height: 100)
@@ -71,7 +88,10 @@ import WorkshopCore
         startButton.bezelStyle = .rounded; startButton.keyEquivalent = "\r"; startButton.bezelColor = .systemBlue
         let spacer = NSView(); spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let actions = NSStackView(views: [spacer, cancelButton, startButton]); actions.spacing = 10
-        let stack = NSStackView(views: [title, detail, presets, limitRow, units, folderRow, message, progress, resultScroll, actions])
+        let options: [NSView] = mode == .pages
+            ? [NSTextField(labelWithString: "每组导出一份，连续范围用 -，各组用逗号分隔"), rangesField, eachPageButton, rangePreview]
+            : [presets, limitRow, units]
+        let stack = NSStackView(views: [title, detail] + options + [folderRow, message, progress, resultScroll, actions])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 15
         stack.translatesAutoresizingMaskIntoConstraints = false
         panel.contentView!.addSubview(stack)
@@ -87,7 +107,13 @@ import WorkshopCore
             resultScroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
             actions.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
+        if mode == .pages {
+            rangesField.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            rangePreview.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        panel.initialFirstResponder = mode == .pages ? rangesField : limitField
         updateFolder()
+        updateRangePreview()
     }
 
     func show() { parent.beginSheet(panel) }
@@ -99,7 +125,35 @@ import WorkshopCore
         guard presets.selectedSegment >= 0 else { return }
         limitField.stringValue = String([5, 10, 20, 50][presets.selectedSegment])
     }
-    func controlTextDidChange(_ obj: Notification) { presets.selectedSegment = -1 }
+    func controlTextDidChange(_ obj: Notification) {
+        if mode == .pages { updateRangePreview() }
+        else { presets.selectedSegment = -1 }
+    }
+    @objc private func eachPageChanged() { updateRangePreview() }
+    private func selectedRanges() throws -> [ClosedRange<Int>] {
+        if eachPageButton.state == .on { return (1...pageCount).map { $0...$0 } }
+        return try PageRanges.parse(rangesField.stringValue, pageCount: pageCount)
+    }
+    private func updateRangePreview() {
+        guard mode == .pages, !running, output == nil else { return }
+        rangesField.isEnabled = eachPageButton.state == .off
+        do {
+            if eachPageButton.state == .on {
+                rangePreview.stringValue = "将导出 \(pageCount) 份 PDF，每份 1 页，包含全部页面。"
+            } else {
+                let ranges = try selectedRanges()
+                let selected = ranges.reduce(0) { $0 + $1.count }
+                rangePreview.stringValue = "将导出 \(ranges.count) 份 PDF，已选择 \(selected) / \(pageCount) 页。" + (selected < pageCount ? "未选择的 \(pageCount - selected) 页不导出。" : "包含全部页面。")
+            }
+            rangePreview.textColor = .secondaryLabelColor; startButton.isEnabled = true
+        } catch {
+            rangePreview.stringValue = error.localizedDescription
+            rangePreview.textColor = .systemRed; startButton.isEnabled = false
+        }
+    }
+    private var inputControls: [NSControl] {
+        mode == .pages ? [rangesField, eachPageButton, chooseButton] : [limitField, presets, chooseButton]
+    }
     @objc private func chooseFolder() {
         let picker = NSOpenPanel()
         picker.canChooseFiles = false; picker.canChooseDirectories = true; picker.canCreateDirectories = true
@@ -110,16 +164,23 @@ import WorkshopCore
     }
     @objc private func start() {
         if let output { NSWorkspace.shared.open(output); return }
-        guard let value = Double(limitField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)),
-              value.isFinite, value >= 0.01, value <= 100_000 else {
-            message.stringValue = SplitError.invalidLimit.localizedDescription; message.textColor = .systemRed; return
+        let selection: SplitSelection
+        if mode == .pages {
+            do { selection = .pageRanges(try selectedRanges()) }
+            catch { message.stringValue = error.localizedDescription; message.textColor = .systemRed; return }
+        } else {
+            guard let value = Double(limitField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  value.isFinite, value >= 0.01, value <= 100_000 else {
+                message.stringValue = SplitError.invalidLimit.localizedDescription; message.textColor = .systemRed; return
+            }
+            selection = .maximumBytes(Int((value * 1_000_000).rounded(.down)))
         }
         running = true
-        [limitField, presets, chooseButton, startButton].forEach { $0.isEnabled = false }
+        (inputControls + [startButton]).forEach { $0.isEnabled = false }
         cancelButton.title = "取消任务"
         progress.doubleValue = 0; progress.isHidden = false
         message.textColor = .secondaryLabelColor; message.stringValue = "正在准备当前文档副本…"
-        onStart?(Int((value * 1_000_000).rounded(.down)), destination)
+        onStart?(selection, destination)
     }
     @objc private func cancel() {
         if running {
@@ -130,6 +191,7 @@ import WorkshopCore
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool { cancel(); return false }
     func update(_ value: SplitProgress) {
+        progress.maxValue = Double(max(1, value.totalPages))
         progress.doubleValue = Double(value.completedPages)
         message.stringValue = "已处理 \(value.completedPages) / \(value.totalPages) 页 · 已校验 \(value.partCount) 份"
     }
@@ -140,17 +202,18 @@ import WorkshopCore
         case .success(let result):
             output = result.folder; progress.isHidden = true
             message.textColor = .systemGreen
-            message.stringValue = "已导出 \(result.parts.count) 份，共 \(result.sourcePageCount) 页，全部通过大小校验。"
+            message.stringValue = "已导出 \(result.parts.count) 份，共 \(result.exportedPageCount) 页，全部通过\(mode == .pages ? "页码" : "大小")校验。" + (result.exportedPageCount < result.sourcePageCount ? "原文档 \(result.sourcePageCount) 页。" : "")
             resultView.string = result.parts.map { part in
                 "\(part.url.lastPathComponent)\n" + (part.pageCount == 1 ? "第 \(part.firstPage) 页" : "第 \(part.firstPage)–\(part.lastPage) 页") + " · \(SplitError.size(part.byteCount))"
             }.joined(separator: "\n\n")
             resultScroll.isHidden = false
             startButton.title = "打开导出文件夹"
-            panel.setContentSize(NSSize(width: 570, height: 500))
+            panel.setContentSize(NSSize(width: 570, height: mode == .pages ? 550 : 500))
         case .failure(let error):
             progress.isHidden = true
             message.textColor = .systemRed; message.stringValue = error.localizedDescription
-            [limitField, presets, chooseButton].forEach { $0.isEnabled = true }
+            inputControls.forEach { $0.isEnabled = true }
+            updateRangePreview()
             cancelButton.title = "取消"
         }
     }

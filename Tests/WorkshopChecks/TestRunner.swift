@@ -51,7 +51,12 @@ func XCTAssertThrowsError<T>(_ expression: @autoclosure () throws -> T, file: St
             ("Oversized page rolls back previous output", { try $0.testOversizedSinglePageAndLateFailureLeaveNoPartialOutput() }),
             ("Cancellation removes partial files", { try $0.testCancellationRemovesAlreadyWrittenParts() }),
             ("Invalid document and limit", { try $0.testInvalidFileAndInvalidLimits() }),
-            ("Password unlock and readable export", { try $0.testEncryptedPDFNeedsCorrectPasswordAndExportsReadableCopy() })
+            ("Password unlock and readable export", { try $0.testEncryptedPDFNeedsCorrectPasswordAndExportsReadableCopy() }),
+            ("Page range input validation and input order", { try $0.testPageRangeInputAndFileOrder() }),
+            ("Page ranges preserve edited pages and file order", { try $0.testPageRangesPreserveEditedPagesAndSelectedFileOrder() }),
+            ("Every page exports as a separate PDF", { try $0.testEveryPageHasItsOwnPDF() }),
+            ("Invalid page plans and cancellation remove output", { try $0.testInvalidPagePlansAndCancellationLeaveNoOutput() }),
+            ("Page range split unlocks password-protected files", { try $0.testPageRangeSplitUsesPassword() })
         ]
         for (name, check) in checks {
             let before = failures
